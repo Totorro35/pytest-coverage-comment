@@ -86,9 +86,18 @@ const getCoverageColor = (percentage) => {
   return color;
 };
 
+const toTitleCase = (str) => {
+  if (!str?.length) {
+    return str;
+  }
+
+  return str[0].toUpperCase() + str[0].slice(1);
+};
+
 module.exports = {
   getPathToFile,
   getContentFile,
   getContent,
   getCoverageColor,
+  toTitleCase,
 };
