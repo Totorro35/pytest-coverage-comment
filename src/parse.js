@@ -1,5 +1,10 @@
 const core = require('@actions/core');
-const { getPathToFile, getContentFile, getCoverageColor } = require('./utils');
+const {
+  getPathToFile,
+  getContentFile,
+  getCoverageColor,
+  toTitleCase,
+} = require('./utils');
 
 // return true if "coverage file" include all special words
 const isValidCoverageContent = (data) => {
@@ -66,6 +71,25 @@ const getActualLines = (data) => {
   return lines.slice(startIndex + 3, endIndex - 1);
 };
 
+// get header names from coverage-file
+const getHeaders = (data) => {
+  if (!data || !data.length) {
+    return null;
+  }
+
+  const lines = data.split('\n');
+  const startIndex = lines.findIndex((l) => l.includes('coverage: platform'));
+
+  if (startIndex === -1) {
+    return null;
+  }
+
+  return lines[startIndex + 1]
+    .split(' ')
+    .filter((l) => l)
+    .map((l) => l.trim());
+};
+
 // get total line from coverage-file
 const getTotal = (data) => {
   if (!data || !data.length) {
@@ -76,6 +100,18 @@ const getTotal = (data) => {
   const line = lines.find((l) => l.includes('TOTAL     '));
 
   return parseTotalLine(line);
+};
+
+// get total line from coverage-file
+const getTotalV2 = (data, headers) => {
+  if (!data || !data.length) {
+    return null;
+  }
+
+  const lines = data.split('\n');
+  const line = lines.find((l) => l.includes('TOTAL     '));
+
+  return parseOneLineV2(line, headers);
 };
 
 // get number of warnings from coverage-file
@@ -127,6 +163,34 @@ const parseOneLine = (line) => {
   };
 };
 
+// parse one line from coverage-file  by headers
+const parseOneLineV2 = (line, headers) => {
+  if (!line) {
+    return null;
+  }
+
+  const parsedLine = line
+    .split('   ')
+    .filter((l) => l)
+    .map((l) => l.trim());
+
+  if (parsedLine.length < 4) {
+    return null;
+  }
+
+  const lastItem = parsedLine[parsedLine.length - 1];
+  const isFullCoverage = lastItem === '100%';
+  const missing = isFullCoverage ? null : lastItem && lastItem.split(', ');
+  const lineArr = headers.map((h, i) => [
+    h.toLowerCase(),
+    parsedLine[i] ?? null,
+  ]);
+  const lineObject = Object.fromEntries(lineArr);
+  lineObject.missing = missing;
+
+  return lineObject;
+};
+
 // parse total line from coverage-file
 const parseTotalLine = (line) => {
   if (!line) {
@@ -149,10 +213,17 @@ const parseTotalLine = (line) => {
 
 // parse coverage-file
 const parse = (data) => {
+  const headers = getHeaders(data);
   const actualLines = getActualLines(data);
 
   if (!actualLines) {
     return null;
+  }
+
+  // 03/04/23 actually this may work for all cases
+  // but to be sure that it will not break the prev behaviour i decided to do anotehr functions
+  if (headers.includes('BrPart') || headers.includes('Branch')) {
+    return actualLines.map((l) => parseOneLineV2(l, headers));
   }
 
   return actualLines.map(parseOneLine);
@@ -218,10 +289,73 @@ const toTable = (data, options, dataFromXml = null) => {
   }
   const totalLine = dataFromXml ? dataFromXml.total : getTotal(data);
   options.hasMissing = coverage.some((c) => c.missing);
+  options.hasBranch = coverage.some((c) => c.branch);
+
+  if (options.hasBranch) {
+    return toTableV2(data, options);
+  }
 
   core.info(`Generating coverage report`);
   const headTr = toHeadRow(options);
   const totalTr = toTotalRow(totalLine, options);
+  const folders = makeFolders(coverage, options);
+
+  const rows = Object.keys(folders)
+    .sort()
+    .filter((folderPath) => {
+      if (!reportOnlyChangedFiles) {
+        return true;
+      }
+
+      const allFilesInFolder = Object.values(folders[folderPath]).map(
+        (f) => f.name
+      );
+
+      folders[folderPath] = folders[folderPath].filter((f) =>
+        changedFiles.all.some((c) => c.includes(f.name))
+      );
+      const fileExistsInFolder = allFilesInFolder.some((f) =>
+        changedFiles.all.some((c) => c.includes(f))
+      );
+      return fileExistsInFolder;
+    })
+    .reduce(
+      (acc, key) => [
+        ...acc,
+        toFolderTd(key, options),
+        ...folders[key].map((file) => toRow(file, key !== '', options)),
+      ],
+      []
+    );
+
+  const hasLines = rows.length > 0;
+  const isFilesChanged =
+    reportOnlyChangedFiles && !hasLines
+      ? `<i>report-only-changed-files is enabled. No files were changed during this commit :)</i>`
+      : '';
+
+  // prettier-ignore
+  return `<table>${headTr}<tbody>${rows.join('')}${totalTr}</tbody></table>${isFilesChanged}`;
+};
+
+// make html table from coverage-file that include "branch"
+const toTableV2 = (data, options, dataFromXml = null) => {
+  const coverage = dataFromXml ? dataFromXml.coverage : parse(data);
+  const { reportOnlyChangedFiles, changedFiles } = options;
+
+  if (!coverage) {
+    core.warning(`Coverage file not well formed`);
+    return null;
+  }
+  const headers = getHeaders(data);
+  options.headers = headers;
+  options.hasMissing = coverage.some((c) => c.missing);
+  options.hasBranch = coverage.some((c) => c.branch);
+  const totalLine = dataFromXml ? dataFromXml.total : getTotalV2(data, headers);
+
+  core.info(`Generating coverage report`);
+  const headTr = toRowV2(coverage, headers, true);
+  const totalTr = toRowV2(totalLine, headers);
   const folders = makeFolders(coverage, options);
 
   const rows = Object.keys(folders)
@@ -267,6 +401,18 @@ const toHeadRow = (options) => {
   const lastTd = options.hasMissing ? '<th>Missing</th>' : '';
 
   return `<tr><th>File</th><th>Stmts</th><th>Miss</th><th>Cover</th>${lastTd}</tr>`;
+};
+
+// make html head row - th
+const toRowV2 = (coverage, headers, titleCase = false) => {
+  const ths = headers
+    .map((h) => {
+      const value = titleCase ? toTitleCase(coverage[h]) : coverage[h];
+      return `<th>${value}</th>`;
+    })
+    .join('');
+
+  return `<tr>${ths}</tr>`;
 };
 
 // make html row - tr
